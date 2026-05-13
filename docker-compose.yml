@@ -1,0 +1,32 @@
+version: "3.8"
+
+# RDP Honeypot: единственный контейнер — самописный listener на :3389.
+# Имитирует Windows Server 2008 R2 (X.224, TLS, NTLMSSP, FILETIME, AV_PAIRs).
+
+services:
+  honeypot:
+    build: ./honeypot
+    container_name: rdp-honeypot
+    hostname: WIN-SRV2008
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:3389:3389"
+    volumes:
+      - ./data/logs:/var/log/honeypot
+    environment:
+      TZ: Europe/Saratov
+      HONEYPOT_COMPUTER: WIN-SRV2008
+      HONEYPOT_DOMAIN: CORP
+      HONEYPOT_DNS_COMPUTER: WIN-SRV2008.corp.local
+      HONEYPOT_DNS_DOMAIN: corp.local
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

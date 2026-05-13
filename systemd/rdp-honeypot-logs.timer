@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically process RDP honeypot logs
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Unit=rdp-honeypot-logs.service
+
+[Install]
+WantedBy=timers.target

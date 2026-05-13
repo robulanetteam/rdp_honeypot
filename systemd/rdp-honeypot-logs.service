@@ -1,0 +1,9 @@
+[Unit]
+Description=Process RDP honeypot logs (publish public/private)
+After=rdp-honeypot.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/srv/rdp-honeypot/.env
+Environment=PYRDP_LOG_DIR=/srv/rdp-honeypot/data/logs
+ExecStart=/usr/bin/python3 /srv/rdp-honeypot/scripts/log_processor.py

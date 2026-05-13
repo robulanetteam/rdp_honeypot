@@ -1,0 +1,10 @@
+data/
+*.pyc
+__pycache__/
+.env
+*.log
+state.json
+# TLS cert (генерируется при старте контейнера)
+*.crt
+*.key
+*.pem
