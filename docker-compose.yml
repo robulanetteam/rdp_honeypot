@@ -2,23 +2,39 @@ version: "3.8"
 
 # RDP Honeypot: единственный контейнер — самописный listener на :3389.
 # Имитирует Windows Server 2008 R2 (X.224, TLS, NTLMSSP, FILETIME, AV_PAIRs).
+#
+# Деплой без зависимостей на хосте (systemd/python/iptables не нужны):
+#   cp .env.example .env   # опционально
+#   docker compose up -d
 
 services:
   honeypot:
-    build: ./honeypot
+    build:
+      context: .
+      dockerfile: honeypot/Dockerfile
     container_name: rdp-honeypot
     hostname: WIN-SRV2008
     restart: unless-stopped
     ports:
       - "0.0.0.0:3389:3389"
-    volumes:
-      - ./data/logs:/var/log/honeypot
     environment:
-      TZ: Europe/Saratov
-      HONEYPOT_COMPUTER: WIN-SRV2008
-      HONEYPOT_DOMAIN: CORP
-      HONEYPOT_DNS_COMPUTER: WIN-SRV2008.corp.local
-      HONEYPOT_DNS_DOMAIN: corp.local
+      TZ: ${TZ:-Europe/Moscow}
+      HONEYPOT_COMPUTER: ${HONEYPOT_COMPUTER:-WIN-SRV2008}
+      HONEYPOT_DOMAIN: ${HONEYPOT_DOMAIN:-CORP}
+      HONEYPOT_DNS_COMPUTER: ${HONEYPOT_DNS_COMPUTER:-WIN-SRV2008.corp.local}
+      HONEYPOT_DNS_DOMAIN: ${HONEYPOT_DNS_DOMAIN:-corp.local}
+      HONEYPOT_FORCE_LEGACY: ${HONEYPOT_FORCE_LEGACY:-1}
+      # Пути внутри контейнера — жёстко привязаны к volumes ниже
+      HONEYPOT_LOG_DIR: /data/logs
+      MIRROR_DIR: /data/public
+      PUBLIC_LOG_NAME: ${PUBLIC_LOG_NAME:-rdp_honeypot.txt}
+      PUBLIC_LOG_EVERY_N: ${PUBLIC_LOG_EVERY_N:-3}
+      WINDOW_HOURS: ${WINDOW_HOURS:-24}
+      PRIVATE_LOG: /data/private/credentials.log
+    volumes:
+      - ./data/logs:/data/logs          # JSONL события + cert
+      - ./data/public:/data/public      # публичный лог (раздавать через nginx/caddy)
+      - ./data/private:/data/private    # пароли/хэши (chmod 0700 на хосте)
     security_opt:
       - no-new-privileges:true
     cap_drop:

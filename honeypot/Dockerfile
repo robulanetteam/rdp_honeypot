@@ -3,21 +3,25 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# supervisor — менеджер процессов (honeypot + log_processor)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates tzdata && \
+    apt-get install -y --no-install-recommends supervisor ca-certificates tzdata && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
+
+# Build context = корень репозитория (context: . в docker-compose.yml)
+COPY honeypot/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY honeypot.py rdp_protocol.py ntlm.py rdp_legacy.py ts_signing_key.py ./
+COPY honeypot/honeypot.py honeypot/rdp_protocol.py honeypot/ntlm.py \
+     honeypot/rdp_legacy.py honeypot/ts_signing_key.py ./
+COPY scripts/log_processor.py ./log_processor.py
+COPY honeypot/log_loop.sh ./log_loop.sh
+COPY honeypot/supervisord.conf ./supervisord.conf
 
-# Непривилегированный пользователь
-RUN useradd -r -s /usr/sbin/nologin honeypot && \
-    mkdir -p /var/log/honeypot && \
-    chown -R honeypot:honeypot /var/log/honeypot /app
-USER honeypot
+RUN chmod +x /app/log_loop.sh && \
+    mkdir -p /data/logs /data/public /data/private /var/log/supervisor
 
 EXPOSE 3389
-CMD ["python", "honeypot.py"]
+CMD ["/usr/bin/supervisord", "-n", "-c", "/app/supervisord.conf"]
