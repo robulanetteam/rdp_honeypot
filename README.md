@@ -66,13 +66,15 @@ rdp-honeypot/
 ├── honeypot/
 │   ├── Dockerfile
 │   ├── requirements.txt        # cryptography
+│   ├── supervisord.conf        # supervisord: honeypot + log_loop
+│   ├── log_loop.sh             # запускает log_processor каждые 60 сек
 │   ├── honeypot.py             # asyncio TCP-сервер, маршрутизация по протоколу
 │   ├── rdp_protocol.py         # TPKT, X.224, RDP_NEG_REQ/RSP
 │   ├── rdp_legacy.py           # MCS, Proprietary Cert, KDF, RC4, Client Info
 │   ├── ts_signing_key.py       # well-known TS RSA signing key (FreeRDP)
 │   └── ntlm.py                 # NTLMSSP CHALLENGE/AUTHENTICATE + hashcat
 ├── scripts/
-│   ├── install.sh              # systemd + iptables + docker compose
+│   ├── install.sh              # опциональный systemd + iptables деплой
 │   ├── uninstall.sh
 │   └── log_processor.py        # JSONL → публичный/приватный лог
 └── systemd/
@@ -87,36 +89,55 @@ rdp-honeypot/
 
 ### Требования
 
-- Docker + docker compose v2
-- Python ≥ 3.11 (только для `log_processor` на хосте)
+- **Docker + docker compose v2** (или docker-compose v1)
 - Свободный порт 3389/tcp
-- Linux с systemd и iptables
+
+Systemd, Python и iptables на хосте **не нужны** — всё работает внутри контейнера.
 
 ### Быстрый старт
 
 ```bash
-git clone https://github.com/robulanetteam/rdp_honeypot /opt/rdp-honeypot
-cd /opt/rdp-honeypot
-cp .env.example .env          # отредактируйте под себя
-sudo bash scripts/install.sh  # установит в /srv/rdp-honeypot (по умолчанию)
-
-# Или указать свой каталог:
-sudo bash scripts/install.sh /opt/rdp-honeypot
-# Либо через переменную окружения:
-sudo INSTALL_DIR=/opt/rdp-honeypot bash scripts/install.sh
+git clone https://github.com/robulanetteam/rdp_honeypot
+cd rdp_honeypot
+docker compose up -d
 ```
 
-`install.sh` делает:
-1. Копирует проект в `$INSTALL_DIR/` (по умолчанию `/srv/rdp-honeypot`)
-2. Устанавливает systemd-юниты
-3. Настраивает iptables rate-limit (цепочка `RDPHONEY`)
-4. `docker compose build && systemctl start rdp-honeypot`
+Готово. Контейнер поднимается с дефолтными настройками без `.env`.
+
+Для кастомизации:
+```bash
+cp .env.example .env   # отредактируйте под себя
+docker compose up -d
+```
+
+Данные на хосте после запуска:
+```
+./data/logs/       — JSONL события + TLS-сертификат
+./data/public/     — публичный лог (раздавайте через nginx/caddy)
+./data/private/    — credentials.log с паролями и hash-строками
+```
+
+### Деплой с systemd + iptables (опционально)
+
+Если нужен автостарт через systemd и rate-limit на уровне iptables:
+
+```bash
+sudo bash scripts/install.sh               # по умолчанию в /srv/rdp-honeypot
+sudo bash scripts/install.sh /opt/rdp      # или свой путь
+sudo INSTALL_DIR=/opt/rdp bash scripts/install.sh
+```
+
+`install.sh` дополнительно:
+- Устанавливает systemd-юниты
+- Настраивает iptables rate-limit (цепочка `RDPHONEY`, по умолч. 5 conn/min/IP)
+- Запускает `systemctl enable --now rdp-honeypot`
 
 ---
 
 ## Конфигурация
 
-Редактируйте `$INSTALL_DIR/.env` (из `.env.example`):
+Все переменные передаются через `.env` (или `environment:` в `docker-compose.yml`).
+Без `.env` контейнер запускается с разумными дефолтами.
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
@@ -125,12 +146,10 @@ sudo INSTALL_DIR=/opt/rdp-honeypot bash scripts/install.sh
 | `HONEYPOT_DNS_COMPUTER` | `WIN-SRV2008.corp.local` | DNS-имя |
 | `HONEYPOT_DNS_DOMAIN` | `corp.local` | DNS-домен |
 | `HONEYPOT_FORCE_LEGACY` | `1` | Форсировать downgrade на legacy RDP (plaintext) |
-| `MIRROR_DIR` | `/srv/http/update` | Путь к DocumentRoot вашего HTTP-сервера (публичный лог) |
-| `PUBLIC_LOG_NAME` | `rdp_honeypot.txt` | Имя публичного файла |
+| `TZ` | `Europe/Moscow` | Часовой пояс для меток в логах |
+| `PUBLIC_LOG_NAME` | `rdp_honeypot.txt` | Имя файла в `./data/public/` |
 | `PUBLIC_LOG_EVERY_N` | `3` | Каждая N-я попытка с IP → публичный лог |
 | `WINDOW_HOURS` | `24` | Окно учёта попыток (часов) |
-| `RATE_LIMIT_PER_MIN` | `5` | iptables: макс. новых соединений/мин с IP |
-| `PRIVATE_LOG` | `/var/log/rdp_honeypot_credentials.log` | Файл паролей (chmod 0600) |
 
 ---
 
@@ -173,9 +192,9 @@ sudo INSTALL_DIR=/opt/rdp-honeypot bash scripts/install.sh
 
 ### Публичный и приватный логи
 
-`log_processor.py` (запускается systemd-таймером раз в минуту):
-- **Публичный** — `$MIRROR_DIR/$PUBLIC_LOG_NAME` (DocumentRoot вашего HTTP-сервера): каждая N-я попытка с IP как строка вида `2026-05-13 14:00 | 1.2.3.4 | attempt #3 in last 24h`
-- **Приватный** — `$PRIVATE_LOG` (chmod 0600): все пары логин/пароль или hashcat-строки
+`log_processor.py` запускается **внутри контейнера** через `supervisord` раз в минуту (`log_loop.sh`):
+- **Публичный** — `./data/public/$PUBLIC_LOG_NAME`: каждая N-я попытка с IP как строка вида `2026-05-13 14:00 | 1.2.3.4 | attempt #3 in last 24h`
+- **Приватный** — `./data/private/credentials.log` (монтируйте с `chmod 0700` на хосте): все пары логин/пароль или hashcat-строки
 
 ---
 
@@ -196,10 +215,10 @@ masscan <IP> -p 3389 --banners
 
 ## Защита
 
-- iptables rate-limit: не более `RATE_LIMIT_PER_MIN` новых соединений в минуту с одного IP
 - Docker: dropped ALL capabilities, только `NET_BIND_SERVICE`, `no-new-privileges`
 - Приватный лог никогда не попадает в публичный каталог
 - TLS-ключ генерируется один раз при старте контейнера и хранится в volume
+- Для iptables rate-limit используйте `scripts/install.sh` или настройте вручную
 
 ---
 
