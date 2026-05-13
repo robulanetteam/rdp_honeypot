@@ -73,14 +73,8 @@ rdp-honeypot/
 │   ├── rdp_legacy.py           # MCS, Proprietary Cert, KDF, RC4, Client Info
 │   ├── ts_signing_key.py       # well-known TS RSA signing key (FreeRDP)
 │   └── ntlm.py                 # NTLMSSP CHALLENGE/AUTHENTICATE + hashcat
-├── scripts/
-│   ├── install.sh              # опциональный systemd + iptables деплой
-│   ├── uninstall.sh
-│   └── log_processor.py        # JSONL → публичный/приватный лог
-└── systemd/
-    ├── rdp-honeypot.service
-    ├── rdp-honeypot-logs.service
-    └── rdp-honeypot-logs.timer
+└── scripts/
+    └── log_processor.py        # JSONL → публичный/приватный лог
 ```
 
 ---
@@ -117,20 +111,14 @@ docker compose up -d
 ./data/private/    — credentials.log с паролями и hash-строками
 ```
 
-### Деплой с systemd + iptables (опционально)
+### Автостарт
 
-Если нужен автостарт через systemd и rate-limit на уровне iptables:
+DockerEngine сам перезапустит контейнер (`restart: unless-stopped`).
+Для запуска при старте системы достаточно, чтобы `docker` был в автостарте:
 
 ```bash
-sudo bash scripts/install.sh               # по умолчанию в /srv/rdp-honeypot
-sudo bash scripts/install.sh /opt/rdp      # или свой путь
-sudo INSTALL_DIR=/opt/rdp bash scripts/install.sh
+systemctl enable docker   # один раз
 ```
-
-`install.sh` дополнительно:
-- Устанавливает systemd-юниты
-- Настраивает iptables rate-limit (цепочка `RDPHONEY`, по умолч. 5 conn/min/IP)
-- Запускает `systemctl enable --now rdp-honeypot`
 
 ---
 
@@ -218,7 +206,7 @@ masscan <IP> -p 3389 --banners
 - Docker: dropped ALL capabilities, только `NET_BIND_SERVICE`, `no-new-privileges`
 - Приватный лог никогда не попадает в публичный каталог
 - TLS-ключ генерируется один раз при старте контейнера и хранится в volume
-- Для iptables rate-limit используйте `scripts/install.sh` или настройте вручную
+- Для iptables rate-limit (опционально): `iptables -I INPUT -p tcp --dport 3389 -m limit --limit 5/min -j ACCEPT && iptables -A INPUT -p tcp --dport 3389 -j DROP`
 
 ---
 
