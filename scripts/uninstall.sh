@@ -1,8 +1,9 @@
 #!/bin/bash
 # Полное удаление honeypot с хоста.
+# Путь установки: первый аргумент или переменная INSTALL_DIR (по умолчанию /srv/rdp-honeypot)
 set -euo pipefail
 
-INSTALL_DIR=/srv/rdp-honeypot
+INSTALL_DIR="${1:-${INSTALL_DIR:-/srv/rdp-honeypot}}"
 
 systemctl disable --now rdp-honeypot-logs.timer 2>/dev/null || true
 systemctl disable --now rdp-honeypot.service 2>/dev/null || true

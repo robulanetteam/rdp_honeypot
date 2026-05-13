@@ -98,11 +98,16 @@ rdp-honeypot/
 git clone https://github.com/robulanetteam/rdp_honeypot /opt/rdp-honeypot
 cd /opt/rdp-honeypot
 cp .env.example .env          # отредактируйте под себя
-sudo bash scripts/install.sh
+sudo bash scripts/install.sh  # установит в /srv/rdp-honeypot (по умолчанию)
+
+# Или указать свой каталог:
+sudo bash scripts/install.sh /opt/rdp-honeypot
+# Либо через переменную окружения:
+sudo INSTALL_DIR=/opt/rdp-honeypot bash scripts/install.sh
 ```
 
 `install.sh` делает:
-1. Копирует проект в `/srv/rdp-honeypot/`
+1. Копирует проект в `$INSTALL_DIR/` (по умолчанию `/srv/rdp-honeypot`)
 2. Устанавливает systemd-юниты
 3. Настраивает iptables rate-limit (цепочка `RDPHONEY`)
 4. `docker compose build && systemctl start rdp-honeypot`
@@ -111,7 +116,7 @@ sudo bash scripts/install.sh
 
 ## Конфигурация
 
-Редактируйте `/srv/rdp-honeypot/.env` (из `.env.example`):
+Редактируйте `$INSTALL_DIR/.env` (из `.env.example`):
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
@@ -120,8 +125,8 @@ sudo bash scripts/install.sh
 | `HONEYPOT_DNS_COMPUTER` | `WIN-SRV2008.corp.local` | DNS-имя |
 | `HONEYPOT_DNS_DOMAIN` | `corp.local` | DNS-домен |
 | `HONEYPOT_FORCE_LEGACY` | `1` | Форсировать downgrade на legacy RDP (plaintext) |
-| `MIRROR_DIR` | `/srv/http/update` | Каталог nginx для публичного лога |
-| `PUBLIC_LOG_NAME` | `rdp_honeypot.txt` | Имя публичного файла на зеркале |
+| `MIRROR_DIR` | `/srv/http/update` | Путь к DocumentRoot вашего HTTP-сервера (публичный лог) |
+| `PUBLIC_LOG_NAME` | `rdp_honeypot.txt` | Имя публичного файла |
 | `PUBLIC_LOG_EVERY_N` | `3` | Каждая N-я попытка с IP → публичный лог |
 | `WINDOW_HOURS` | `24` | Окно учёта попыток (часов) |
 | `RATE_LIMIT_PER_MIN` | `5` | iptables: макс. новых соединений/мин с IP |
@@ -169,7 +174,7 @@ sudo bash scripts/install.sh
 ### Публичный и приватный логи
 
 `log_processor.py` (запускается systemd-таймером раз в минуту):
-- **Публичный** — `$MIRROR_DIR/$PUBLIC_LOG_NAME`: каждая N-я попытка с IP как строка вида `2026-05-13 14:00 | 1.2.3.4 | attempt #3 in last 24h`
+- **Публичный** — `$MIRROR_DIR/$PUBLIC_LOG_NAME` (DocumentRoot вашего HTTP-сервера): каждая N-я попытка с IP как строка вида `2026-05-13 14:00 | 1.2.3.4 | attempt #3 in last 24h`
 - **Приватный** — `$PRIVATE_LOG` (chmod 0600): все пары логин/пароль или hashcat-строки
 
 ---
@@ -193,7 +198,7 @@ masscan <IP> -p 3389 --banners
 
 - iptables rate-limit: не более `RATE_LIMIT_PER_MIN` новых соединений в минуту с одного IP
 - Docker: dropped ALL capabilities, только `NET_BIND_SERVICE`, `no-new-privileges`
-- Приватный лог никогда не попадает на публичное зеркало
+- Приватный лог никогда не попадает в публичный каталог
 - TLS-ключ генерируется один раз при старте контейнера и хранится в volume
 
 ---

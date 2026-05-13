@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-LOG_DIR = Path(os.environ.get("HONEYPOT_LOG_DIR", "/srv/rdp-honeypot/data/logs"))
+LOG_DIR = Path(os.environ.get("HONEYPOT_LOG_DIR", "/var/log/honeypot"))
 CONN_JSONL = LOG_DIR / "connections.jsonl"
 CRED_JSONL = LOG_DIR / "credentials.jsonl"
 STATE_FILE = LOG_DIR / "state.json"

@@ -4,6 +4,6 @@ After=rdp-honeypot.service
 
 [Service]
 Type=oneshot
-EnvironmentFile=-/srv/rdp-honeypot/.env
-Environment=PYRDP_LOG_DIR=/srv/rdp-honeypot/data/logs
-ExecStart=/usr/bin/python3 /srv/rdp-honeypot/scripts/log_processor.py
+EnvironmentFile=-@@INSTALL_DIR@@/.env
+Environment=HONEYPOT_LOG_DIR=@@INSTALL_DIR@@/data/logs
+ExecStart=/usr/bin/python3 @@INSTALL_DIR@@/scripts/log_processor.py

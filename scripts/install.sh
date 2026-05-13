@@ -1,15 +1,18 @@
 #!/bin/bash
 # Установка RDP honeypot на хост.
-# - Создаёт /srv/rdp-honeypot/ из текущего каталога
-# - Устанавливает systemd-юниты
-# - Применяет iptables rate-limit для входящего TCP/3389
+#
+# Использование:
+#   sudo bash install.sh [INSTALL_DIR]
+#   sudo INSTALL_DIR=/opt/rdp-honeypot bash install.sh
+#
+# По умолчанию устанавливается в /srv/rdp-honeypot.
 #
 # Запускать от root.
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-INSTALL_DIR=/srv/rdp-honeypot
+INSTALL_DIR="${1:-${INSTALL_DIR:-/srv/rdp-honeypot}}"
 RATE_LIMIT_PER_MIN="${RATE_LIMIT_PER_MIN:-5}"
 
 echo "[*] Проверка зависимостей..."
@@ -35,10 +38,14 @@ if [ ! -f "$INSTALL_DIR/.env" ]; then
     cp "$INSTALL_DIR/.env.example" "$INSTALL_DIR/.env"
 fi
 
-echo "[*] Установка systemd-юнитов..."
-install -m 644 "$INSTALL_DIR/systemd/rdp-honeypot.service" /etc/systemd/system/
-install -m 644 "$INSTALL_DIR/systemd/rdp-honeypot-logs.service" /etc/systemd/system/
-install -m 644 "$INSTALL_DIR/systemd/rdp-honeypot-logs.timer" /etc/systemd/system/
+echo "[*] Установка systemd-юнитов (INSTALL_DIR=$INSTALL_DIR)..."
+# Подставляем реальный путь вместо плейсхолдера @@INSTALL_DIR@@
+for unit in rdp-honeypot.service rdp-honeypot-logs.service rdp-honeypot-logs.timer; do
+    sed "s|@@INSTALL_DIR@@|${INSTALL_DIR}|g" \
+        "$INSTALL_DIR/systemd/$unit" \
+        > "/etc/systemd/system/$unit"
+    chmod 644 "/etc/systemd/system/$unit"
+done
 systemctl daemon-reload
 
 echo "[*] iptables rate-limit для входящего 3389/tcp ($RATE_LIMIT_PER_MIN/мин на IP)..."
@@ -73,10 +80,10 @@ systemctl enable --now rdp-honeypot-logs.timer
 
 echo
 echo "===== УСТАНОВЛЕНО ====="
-echo "Каталог: $INSTALL_DIR"
-echo "Статус:  systemctl status rdp-honeypot"
-echo "Логи:    journalctl -u rdp-honeypot -f"
-echo "Публичный лог:  /srv/http/update/rdp_honeypot.txt"
-echo "Приватный лог:  /var/log/rdp_honeypot_credentials.log (chmod 0600)"
+echo "Каталог:         $INSTALL_DIR"
+echo "Статус:          systemctl status rdp-honeypot"
+echo "Логи:            journalctl -u rdp-honeypot -f"
+echo "Приватный лог:   /var/log/rdp_honeypot_credentials.log (chmod 0600)"
+echo "Публичный лог:   \$MIRROR_DIR/\$PUBLIC_LOG_NAME (из .env)"
 echo
 echo "Проверка iptables: iptables -L RDPHONEY -v"
