@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from classifier import SessionInfo, IpAnalysis, classify_ip
+from classifier import SessionInfo, IpAnalysis, classify_ip, correlate_subnet_scan
 
 LOG_DIR      = Path(os.environ.get("HONEYPOT_LOG_DIR", "/var/log/honeypot"))
 CONN_JSONL   = LOG_DIR / "connections.jsonl"
@@ -288,13 +288,29 @@ def run_analytics(state: dict[str, Any], now: datetime) -> None:
             )
         )
 
+    # Коррелируем /24: если ≥3 разных IP из одной подсети шлют TPKT-зонды в течение часа
+    coordinated_ips = correlate_subnet_scan(by_ip)
+
     now_str = now.isoformat()
     for ip, sessions in by_ip.items():
         analysis = classify_ip(sessions)
-        prev     = ip_class.get(ip, {})
-        changed  = (
+
+        # Subnet correlation upgrade: конкретные IP-участники скоординированного скана
+        if ip in coordinated_ips and "subnet_coordinated_scan" not in analysis.reasons:
+            analysis.reasons = analysis.reasons + ["subnet_coordinated_scan"]
+            if analysis.classification not in ("scanner", "bruteforcer"):
+                analysis.classification = "scanner"
+                analysis.confidence = "medium"
+
+        prev         = ip_class.get(ip, {})
+        prev_reasons = prev.get("reasons", [])
+        changed      = (
             prev.get("classification") != analysis.classification
             or prev.get("confidence") != analysis.confidence
+            or (
+                "subnet_coordinated_scan" in analysis.reasons
+                and "subnet_coordinated_scan" not in prev_reasons
+            )
         )
         if changed:
             entry = {

@@ -153,3 +153,67 @@ def classify_ip(sessions: list[SessionInfo]) -> IpAnalysis:
         protocols_seen=protocols,
         has_credentials=has_creds,
     )
+
+
+# ── Subnet correlation ────────────────────────────────────────────────────────
+
+def _has_tpkt_probe(sessions: list[SessionInfo]) -> bool:
+    """True if any session looks like a TLS/port probe, not a real RDP client."""
+    return any(
+        any("TPKT" in e for e in s.errors) or "no_tpkt_silent_drop" in s.stages
+        for s in sessions
+    )
+
+
+def _probe_timestamps(sessions: list[SessionInfo]) -> list[float]:
+    """Return first_ts for sessions that are TPKT probes."""
+    return [
+        s.first_ts
+        for s in sessions
+        if s.first_ts > 0
+        and (any("TPKT" in e for e in s.errors) or "no_tpkt_silent_drop" in s.stages)
+    ]
+
+
+def correlate_subnet_scan(
+    by_ip: dict[str, list[SessionInfo]],
+    window_secs: float = 3600.0,
+    min_ips: int = 3,
+) -> set[str]:
+    """
+    Detect coordinated /24 subnet scans.
+
+    Returns the set of IPs participating in a /24 subnet where ≥ min_ips
+    distinct addresses sent TPKT-probe traffic within window_secs seconds.
+    IPv6: /48 is used instead of /24.
+    """
+    import ipaddress
+
+    # /24-network string → [(ip, earliest_probe_ts)]
+    subnet_map: dict[str, list[tuple[str, float]]] = {}
+    for ip, sessions in by_ip.items():
+        if not _has_tpkt_probe(sessions):
+            continue
+        try:
+            addr = ipaddress.ip_address(ip)
+            net = ipaddress.ip_network(
+                f"{addr}/24" if addr.version == 4 else f"{addr}/48",
+                strict=False,
+            )
+        except ValueError:
+            continue
+        ts_list = _probe_timestamps(sessions)
+        if not ts_list:
+            continue
+        subnet_map.setdefault(str(net), []).append((ip, min(ts_list)))
+
+    coordinated: set[str] = set()
+    for entries in subnet_map.values():
+        if len(entries) < min_ips:
+            continue
+        ts_sorted = sorted(t for _, t in entries)
+        if ts_sorted[-1] - ts_sorted[0] <= window_secs:
+            for ip, _ in entries:
+                coordinated.add(ip)
+
+    return coordinated
