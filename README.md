@@ -49,7 +49,8 @@ rdp_honeypot/
 │   ├── ts_signing_key.py       # well-known TS RSA signing key
 │   └── ntlm.py                 # NTLMSSP + hashcat output
 └── scripts/
-    └── log_processor.py        # JSONL → публичный/приватный лог
+    ├── log_processor.py        # JSONL → публичный/приватный лог + аналитика
+    └── classifier.py           # классификатор IP: scanner / bruteforcer / accidental
 ```
 
 ---
@@ -118,8 +119,33 @@ systemctl enable docker
 ```
 
 `log_processor.py` (supervisord, раз в минуту):
-- `./data/public/rdp_honeypot.txt` — каждая N-я попытка: `2026-05-13 14:00 | 1.2.3.4 | attempt #3 in last 24h`
+- `./data/public/rdp_honeypot.txt` — каждая N-я попытка с тегом класса: `2026-05-13 14:00 | 1.2.3.4 | attempt #3 in last 24h | scanner`
 - `./data/private/credentials.log` — все пароли и hashcat-строки
+- `./data/logs/analytics.jsonl` — классификация каждого IP при изменении:
+
+```json
+{"timestamp":"2026-05-15T10:00:00+03:00","source_ip":"34.38.74.158",
+ "classification":"scanner","confidence":"high",
+ "reasons":["scanner_cookie","tls_direct_probe","hybrid_ex_protocol","rapid_multiconn:4x_in_17s"],
+ "sessions_total":4,"protocols_seen":["0x00000003","0x0000000b"],
+ "has_credentials":false}
+```
+
+**Классификатор** (`classifier.py`) использует сигналы сессии:
+
+| Сигнал | Класс | Очки |
+|---|---|---|
+| Cookie содержит `nmap` / `masscan` / `zgrab` / `shodan` / `censys` | scanner | +5 |
+| TPKT exception — прямой TLS-зонд | scanner | +3 |
+| `PROTOCOL_HYBRID_EX` bit (0x08) в requested_protocols | scanner | +3 |
+| ≥3 соединений за <120 сек | scanner | +2 |
+| >2 разных requested_protocols | scanner | +1 |
+| Учётные данные захвачены | bruteforcer | +10 |
+| Дошёл до `RDP_LEGACY` | bruteforcer | +5 |
+| Downgrade NEG_FAILURE → повторное подключение в legacy | bruteforcer | +3 |
+| ≥5 сессий от IP | bruteforcer | +2 |
+
+Результат: `scanner` / `bruteforcer` / `accidental` / `unknown`, confidence: `low` / `medium` / `high`.
 
 ---
 
