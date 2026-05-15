@@ -11,6 +11,8 @@ RDP Honeypot log processor.
   * credentials → приватный лог
   * классифицирует каждый IP: scanner / bruteforcer / accidental / unknown
     результат → data/logs/analytics.jsonl (пишется при изменении класса)
+  * GeoIP обогащение (страна, город, ASN) через локальную .mmdb базу
+  * Telegram уведомления: credentials + новый bruteforcer high
 
 Запускается supervisord (log_loop.sh) раз в минуту.
 """
@@ -20,9 +22,11 @@ import json
 import logging
 import os
 import sys
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from classifier import (
     SessionInfo, IpAnalysis, classify_ip, correlate_subnet_scan,
@@ -42,8 +46,94 @@ PRIVATE_LOG  = Path(os.environ.get("PRIVATE_LOG", "/var/log/rdp_honeypot_credent
 EVERY_N  = int(os.environ.get("PUBLIC_LOG_EVERY_N", "3"))
 WINDOW   = timedelta(hours=int(os.environ.get("WINDOW_HOURS", "24")))
 
+GEOIP_DB         = os.environ.get("GEOIP_DB", "/data/geoip/GeoLite2-City.mmdb")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("rdp-honeypot")
+
+
+# ── GeoIP ─────────────────────────────────────────────────────────────────────
+
+_geoip_reader: Any = None  # geoip2.database.Reader or None
+
+
+def _get_geoip_reader():
+    global _geoip_reader
+    if _geoip_reader is not None:
+        return _geoip_reader
+    if not Path(GEOIP_DB).exists():
+        return None
+    try:
+        import geoip2.database  # type: ignore
+        _geoip_reader = geoip2.database.Reader(GEOIP_DB)
+        log.info("GeoIP: загружена база %s", GEOIP_DB)
+    except Exception as exc:
+        log.warning("GeoIP: не удалось загрузить базу %s: %s", GEOIP_DB, exc)
+        _geoip_reader = False  # sentinel — не пытаться повторно
+    return _geoip_reader or None
+
+
+def geoip_lookup(ip: str) -> dict[str, str]:
+    """Вернуть {'country': 'RU', 'city': 'Moscow', 'asn': 'AS12345 Org'} или {}."""
+    reader = _get_geoip_reader()
+    if reader is None:
+        return {}
+    try:
+        rec = reader.city(ip)
+        result: dict[str, str] = {}
+        if rec.country.iso_code:
+            result["country"] = rec.country.iso_code
+        if rec.city.name:
+            result["city"] = rec.city.name
+        return result
+    except Exception:
+        return {}
+
+
+def geoasn_lookup(ip: str) -> str:
+    """Вернуть 'AS12345 OrgName' или ''."""
+    # GeoLite2-City не содержит ASN — для ASN нужен отдельный GeoLite2-ASN.mmdb
+    asn_db = Path(GEOIP_DB).parent / "GeoLite2-ASN.mmdb"
+    if not asn_db.exists():
+        return ""
+    try:
+        import geoip2.database  # type: ignore
+        with geoip2.database.Reader(str(asn_db)) as r:
+            rec = r.asn(ip)
+            num = rec.autonomous_system_number or ""
+            org = rec.autonomous_system_organization or ""
+            if num and org:
+                return f"AS{num} {org}"
+            return str(num or org)
+    except Exception:
+        return ""
+
+
+# ── Telegram ──────────────────────────────────────────────────────────────────
+
+def telegram_send(text: str) -> None:
+    """Отправить сообщение в Telegram. Тихо глотает ошибки."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = json.dumps({
+        "chat_id":    TELEGRAM_CHAT_ID,
+        "text":       text,
+        "parse_mode": "HTML",
+    }).encode()
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                log.warning("Telegram: HTTP %d", resp.status)
+    except urllib.error.URLError as exc:
+        log.warning("Telegram: не удалось отправить: %s", exc)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -258,6 +348,10 @@ def process_credentials(state: dict[str, Any]) -> int:
             if sess.get("ip") == src:
                 sess["has_credentials"] = True
 
+        geo   = geoip_lookup(src)
+        asn   = geoasn_lookup(src)
+        geo_str = " | ".join(filter(None, [geo.get("country"), geo.get("city"), asn]))
+
         if password:
             line = (
                 f"{ts} | src={src} | via={via} | "
@@ -273,6 +367,18 @@ def process_credentials(state: dict[str, Any]) -> int:
         append_private(line)
         log.info("Credential captured (src=%s via=%s user=%r %s)",
                  src, via, user, "PLAINTEXT" if password else "hash-only")
+
+        # Telegram alert
+        cred_type = "PLAINTEXT" if password else "NTLM hash"
+        tg_msg = (
+            f"\U0001f6a8 <b>RDP Honeypot: credentials captured</b>\n"
+            f"IP: <code>{src}</code>"
+            + (f" | {geo_str}" if geo_str else "") + "\n"
+            f"via: {via} | user: {domain}\\{user}\n"
+            f"type: {cred_type}\n"
+            f"time: {ts}"
+        )
+        telegram_send(tg_msg)
 
     return processed
 
@@ -356,6 +462,10 @@ def run_analytics(state: dict[str, Any], now: datetime) -> None:
             or abs(scope - prev.get("scope", 0)) >= 10
         )
         if changed:
+            geo  = geoip_lookup(ip)
+            asn  = geoasn_lookup(ip)
+            geo_str = " | ".join(filter(None, [geo.get("country"), geo.get("city"), asn]))
+
             first_seen_ts  = hist.get("first_seen", last_ts)
             first_seen_str = (
                 datetime.fromtimestamp(first_seen_ts, tz=timezone.utc).astimezone().isoformat()
@@ -375,13 +485,35 @@ def run_analytics(state: dict[str, Any], now: datetime) -> None:
                 "block_until":     block_until,
                 "threat_days":     threat_days_count,
                 "first_seen":      first_seen_str,
+                "country":         geo.get("country", ""),
+                "city":            geo.get("city", ""),
+                "asn":             asn,
             }
             append_analytics(entry)
             log.info(
-                "Classification %s → %s [%s] scope=%d days=%d %s",
+                "Classification %s → %s [%s] scope=%d days=%d %s%s",
                 ip, analysis.classification, analysis.confidence,
                 scope, threat_days_count, ",".join(analysis.reasons),
+                f" [{geo_str}]" if geo_str else "",
             )
+
+            # Telegram alert: только новые bruteforcer/high
+            is_new_brute = (
+                analysis.classification == "bruteforcer"
+                and analysis.confidence == "high"
+                and prev.get("classification") != "bruteforcer"
+            )
+            if is_new_brute:
+                reasons_str = ", ".join(analysis.reasons[:5])
+                tg_msg = (
+                    f"\U0001f4a5 <b>RDP Honeypot: bruteforcer detected</b>\n"
+                    f"IP: <code>{ip}</code>"
+                    + (f" | {geo_str}" if geo_str else "") + "\n"
+                    f"scope: {scope} | block_until: {(block_until or '—')[:10]}\n"
+                    f"signals: {reasons_str}\n"
+                    f"time: {ip_str[:19]}"
+                )
+                telegram_send(tg_msg)
         ip_class[ip] = {
             "classification": analysis.classification,
             "confidence":     analysis.confidence,
@@ -470,10 +602,13 @@ def main() -> int:
         state["ip_attempts"] = {}
         state["ip_history"]  = {}
         state["ip_logged"]   = {}
-        # analytics.jsonl — обнуляем, чтобы не было дублей
+        # analytics.jsonl + public log — обнуляем, чтобы не было дублей
         if ANALYTICS.exists():
             ANALYTICS.unlink()
             log.info("Удалён %s (будет создан заново)", ANALYTICS)
+        if PUBLIC_LOG.exists():
+            PUBLIC_LOG.unlink()
+            log.info("Удалён %s (будет создан заново)", PUBLIC_LOG)
     elif args.reclassify:
         log.info("--reclassify: сброс ip_class (сессии сохранены)")
         state["ip_class"] = {}

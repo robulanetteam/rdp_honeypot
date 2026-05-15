@@ -31,10 +31,14 @@ services:
       PUBLIC_LOG_EVERY_N: ${PUBLIC_LOG_EVERY_N:-3}
       WINDOW_HOURS: ${WINDOW_HOURS:-24}
       PRIVATE_LOG: /data/private/credentials.log
+      GEOIP_DB: /data/geoip/GeoLite2-City.mmdb
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     volumes:
       - ./data/logs:/data/logs          # JSONL события + cert
       - ./data/public:/data/public      # публичный лог (раздавать через nginx/caddy)
       - ./data/private:/data/private    # пароли/хэши (chmod 0700 на хосте)
+      - ./data/geoip:/data/geoip:ro     # GeoLite2-City.mmdb (скачать вручную)
       # Python-исходники монтируются поверх запечённых в образ файлов.
       # git pull + docker compose restart — достаточно для обновления кода
       # без пересборки образа. Пересборка нужна только при изменении
