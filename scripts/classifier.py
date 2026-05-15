@@ -35,7 +35,8 @@ from typing import Optional
 
 _SCANNER_RE = re.compile(
     r"nmap|masscan|zmap|zgrab|rdpscan|metasploit|shodan|censys|nuclei"
-    r"|stretchoid|internetmeasurement|alphasoc|mirai",
+    r"|stretchoid|internetmeasurement|alphasoc|mirai"
+    r"|mstshash=test",  # Metasploit auxiliary/scanner/rdp/rdp_scanner default
     re.IGNORECASE,
 )
 
@@ -87,6 +88,11 @@ def classify_ip(sessions: list[SessionInfo]) -> IpAnalysis:
             scanner_score += 3
             reasons.append("tls_direct_probe")
             break
+
+    # no_tpkt_silent_drop — TCP connect без данных (port check или медленный TLS-зонд)
+    if any("no_tpkt_silent_drop" in s.stages for s in sessions):
+        scanner_score += 2
+        reasons.append("silent_drop_probe")
 
     # HYBRID_EX bit (0x08) — автоматизированный современный клиент (Shodan, Censys)
     for s in sessions:
