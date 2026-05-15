@@ -1,4 +1,4 @@
-version: "3.8"
+
 
 # RDP Honeypot: единственный контейнер — самописный listener на :3389.
 # Имитирует Windows Server 2008 R2 (X.224, TLS, NTLMSSP, FILETIME, AV_PAIRs).
