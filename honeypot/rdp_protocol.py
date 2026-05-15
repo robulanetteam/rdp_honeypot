@@ -125,7 +125,7 @@ def build_x224_cc(selected_protocol: int) -> bytes:
     neg_rsp = struct.pack(
         "<BBHI",
         RDP_NEG_RSP,
-        0x00,            # flags: 0 (можно 0x01 EXTENDED_CLIENT_DATA_SUPPORTED)
+        0x01,            # flags: EXTENDED_CLIENT_DATA_SUPPORTED (Windows Vista/7/2008 R2+)
         8,               # length
         selected_protocol,
     )
