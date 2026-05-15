@@ -299,9 +299,14 @@ def run_analytics(state: dict[str, Any], now: datetime) -> None:
     # Коррелируем /24: если ≥3 разных IP из одной подсети шлют TPKT-зонды в течение часа
     coordinated_ips = correlate_subnet_scan(by_ip)
 
-    now_str = now.isoformat()
     for ip, sessions in by_ip.items():
         analysis = classify_ip(sessions)
+        # Timestamp = время последней активности IP, а не время запуска классификатора
+        last_ts = max((s.last_ts for s in sessions if s.last_ts > 0), default=0.0)
+        if last_ts > 0:
+            ip_str = datetime.fromtimestamp(last_ts, tz=timezone.utc).astimezone().isoformat()
+        else:
+            ip_str = now.isoformat()
 
         # Subnet correlation upgrade: конкретные IP-участники скоординированного скана
         if ip in coordinated_ips and "subnet_coordinated_scan" not in analysis.reasons:
@@ -322,7 +327,7 @@ def run_analytics(state: dict[str, Any], now: datetime) -> None:
         )
         if changed:
             entry = {
-                "timestamp":      now_str,
+                "timestamp":      ip_str,
                 "source_ip":      ip,
                 "classification": analysis.classification,
                 "confidence":     analysis.confidence,

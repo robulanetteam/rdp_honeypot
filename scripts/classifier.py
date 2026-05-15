@@ -115,8 +115,12 @@ def detect_cve_hints(sessions: list[SessionInfo]) -> list[str]:
             hits.append(label)
             seen.add(label)
 
-    # PoC / exploit tool fingerprint via clientBuild
+    # PoC / exploit tool fingerprint via clientBuild.
+    # Only meaningful if session reached mcs_connect_initial — otherwise
+    # client_build=0 is just the uninitialized default (e.g. TLS probes).
     for s in sessions:
+        if "mcs_connect_initial" not in s.stages:
+            continue
         if s.client_build in _EXPLOIT_CLIENT_BUILDS:
             label = _EXPLOIT_CLIENT_BUILDS[s.client_build]
             if label not in seen:
