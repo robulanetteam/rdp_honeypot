@@ -350,13 +350,51 @@ def run_analytics(state: dict[str, Any], now: datetime) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description="RDP Honeypot log processor")
+    ap.add_argument(
+        "--reprocess",
+        action="store_true",
+        help=(
+            "Сбросить смещения и пересчитать все сессии/аналитику с нуля. "
+            "Используется после обновления классификатора."
+        ),
+    )
+    ap.add_argument(
+        "--reclassify",
+        action="store_true",
+        help=(
+            "Сохранить накопленные сессии, но принудительно переклассифицировать "
+            "все IP заново. Быстрее --reprocess."
+        ),
+    )
+    args = ap.parse_args()
+
     if not LOG_DIR.exists():
         log.error("Каталог логов %s не существует", LOG_DIR)
         return 1
 
     state = load_state()
     now   = datetime.now(timezone.utc).astimezone()
-    prune_old(state, now)
+
+    if args.reprocess:
+        log.info("--reprocess: сброс offsets, sessions, ip_class, ip_creds")
+        state["offsets"]     = {}
+        state["sessions"]    = {}
+        state["ip_class"]    = {}
+        state["ip_creds"]    = {}
+        state["ip_attempts"] = {}
+        # analytics.jsonl — обнуляем, чтобы не было дублей
+        if ANALYTICS.exists():
+            ANALYTICS.unlink()
+            log.info("Удалён %s (будет создан заново)", ANALYTICS)
+    elif args.reclassify:
+        log.info("--reclassify: сброс ip_class (сессии сохранены)")
+        state["ip_class"] = {}
+
+    if not args.reprocess:
+        # prune нужен только при инкрементальном прогоне
+        prune_old(state, now)
 
     n_cred = process_credentials(state)
     n_conn = process_connections(state, now)
