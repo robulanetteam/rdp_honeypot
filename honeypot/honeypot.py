@@ -505,6 +505,8 @@ async def _legacy_state_machine(reader, writer, peer, encrypted: bool, source: s
 
     # ---- Security Exchange (только в legacy encrypted) ----
     client_decrypt_key = None
+    server_encrypt_key = None
+    mac_key            = None
     if encrypted:
         try:
             sec_exch = await asyncio.wait_for(read_tpkt(reader), timeout=READ_TIMEOUT)
@@ -533,6 +535,8 @@ async def _legacy_state_machine(reader, writer, peer, encrypted: bool, source: s
             return
         keys = legacy.derive_keys(client_random, server_random)
         client_decrypt_key = keys["client_decrypt_key"]
+        server_encrypt_key = keys["server_encrypt_key"]
+        mac_key            = keys["mac_key"]
         log_connection(peer, "session_keys_derived", {
             "client_random_hash": (md5_short(client_random)),
         })
@@ -574,7 +578,40 @@ async def _legacy_state_machine(reader, writer, peer, encrypted: bool, source: s
         "unicode": creds.is_unicode,
     })
 
-    # Закрываем соединение — клиент увидит "сервер прервал сессию".
+    # ---- Завершаем handshake: Server License Error PDU (STATUS_VALID_CLIENT) ----
+    # Это сигнал клиенту: "учётка принята, лицензия валидна, жди Demand Active".
+    # Многие сканеры/брутфорсеры на этом этапе уже маркируют логин как успешный.
+    # Реальный mstsc сидит ~30с в ожидании Demand Active, после чего отваливается
+    # с обычным таймаутом — пользователь не увидит "wrong password".
+    try:
+        license_pdu = legacy.build_server_license_pdu(
+            encrypt=bool(encrypted and server_encrypt_key and mac_key),
+            mac_key=mac_key,
+            encrypt_key=server_encrypt_key,
+        )
+        writer.write(license_pdu)
+        await writer.drain()
+        log_connection(peer, "license_valid_client_sent", {
+            "encrypted": bool(encrypted and server_encrypt_key),
+        })
+    except (ConnectionResetError, BrokenPipeError, OSError) as e:
+        log_connection(peer, "license_send_fail", {"error": repr(e)})
+        return
+
+    # Подержим соединение открытым: дадим клиенту "переварить" license PDU и
+    # потенциально прислать Confirm Active / Synchronize. Мы их не парсим —
+    # просто сливаем входящий поток в /dev/null с лимитом.
+    deadline_bytes = 16 * 1024
+    received = 0
+    try:
+        while received < deadline_bytes:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=10.0)
+            if not chunk:
+                break
+            received += len(chunk)
+    except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError, OSError):
+        pass
+    log_connection(peer, "post_license_drained", {"bytes": received})
 
 
 def md5_short(b: bytes) -> str:

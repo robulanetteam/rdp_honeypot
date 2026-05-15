@@ -46,6 +46,10 @@ PRIVATE_LOG  = Path(os.environ.get("PRIVATE_LOG", "/var/log/rdp_honeypot_credent
 EVERY_N  = int(os.environ.get("PUBLIC_LOG_EVERY_N", "3"))
 WINDOW   = timedelta(hours=int(os.environ.get("WINDOW_HOURS", "24")))
 
+# Ротация публичного лога: хранить не более MAX_LINES строк и не старше MAX_DAYS дней.
+PUBLIC_LOG_MAX_DAYS  = int(os.environ.get("PUBLIC_LOG_MAX_DAYS", "14"))
+PUBLIC_LOG_MAX_LINES = int(os.environ.get("PUBLIC_LOG_MAX_LINES", "5000"))
+
 GEOIP_DB         = os.environ.get("GEOIP_DB", "/data/geoip/GeoLite2-City.mmdb")
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -525,7 +529,6 @@ def run_analytics(state: dict[str, Any], now: datetime) -> None:
         }
 
 # ── Blocklist export ───────────────────────────────────────────────────────
-
 def write_blocklist(state: dict[str, Any], now: datetime) -> None:
     """Записать актуальный blocklist в MIRROR_DIR (plain + JSON)."""
     ip_history = state.get("ip_history", {})
@@ -562,6 +565,71 @@ def write_blocklist(state: dict[str, Any], now: datetime) -> None:
         json.dumps(active, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+# ── Public log rotation ───────────────────────────────────────────────────
+
+def rotate_public_log(now: datetime) -> None:
+    """
+    Урезать PUBLIC_LOG: удалить строки старше PUBLIC_LOG_MAX_DAYS дней
+    и оставить не более PUBLIC_LOG_MAX_LINES последних строк.
+
+    Формат строки: "YYYY-MM-DD HH:MM +ZZZZ | ip | ...".
+    Атомарная замена через .tmp.
+    """
+    if not PUBLIC_LOG.exists():
+        return
+    try:
+        size = PUBLIC_LOG.stat().st_size
+    except OSError:
+        return
+    if size == 0:
+        return
+
+    cutoff_date = (now - timedelta(days=PUBLIC_LOG_MAX_DAYS)).date()
+    kept: list[str] = []
+    try:
+        with PUBLIC_LOG.open("r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line:
+                    continue
+                # Дата = первые 10 символов строки (YYYY-MM-DD).
+                date_prefix = line[:10]
+                try:
+                    line_date = datetime.strptime(date_prefix, "%Y-%m-%d").date()
+                except ValueError:
+                    # Строка без распознаваемой даты — сохраняем (на всякий случай).
+                    kept.append(line)
+                    continue
+                if line_date >= cutoff_date:
+                    kept.append(line)
+    except OSError as exc:
+        log.warning("rotate_public_log: не удалось прочитать %s: %s", PUBLIC_LOG, exc)
+        return
+
+    if len(kept) > PUBLIC_LOG_MAX_LINES:
+        kept = kept[-PUBLIC_LOG_MAX_LINES:]
+
+    # Если ничего не изменилось — не трогаем файл.
+    new_content = "\n".join(kept) + ("\n" if kept else "")
+    try:
+        current = PUBLIC_LOG.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        current = ""
+    if new_content == current:
+        return
+
+    tmp = PUBLIC_LOG.with_suffix(PUBLIC_LOG.suffix + ".tmp")
+    try:
+        tmp.write_text(new_content, encoding="utf-8")
+        tmp.replace(PUBLIC_LOG)
+        log.info(
+            "rotate_public_log: %s урезан до %d строк (cutoff %s)",
+            PUBLIC_LOG.name, len(kept), cutoff_date.isoformat(),
+        )
+    except OSError as exc:
+        log.warning("rotate_public_log: не удалось записать %s: %s", PUBLIC_LOG, exc)
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -621,6 +689,7 @@ def main() -> int:
     n_conn = process_connections(state, now)
     run_analytics(state, now)
     write_blocklist(state, now)
+    rotate_public_log(now)
     save_state(state)
 
     log.info("Обработано: connections=%d credentials=%d", n_conn, n_cred)

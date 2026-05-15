@@ -439,8 +439,10 @@ def derive_keys(client_random: bytes, server_random: bytes) -> dict[str, bytes]:
     Возвращает dict с:
       master_secret (48 байт)
       session_key_blob (48 байт)
+      mac_key             — 128-bit, для подписи отправляемых сервером пакетов
       client_encrypt_key  — клиент шифрует им свои сообщения серверу
       client_decrypt_key  — сервер расшифровывает им сообщения от клиента (== client_encrypt_key)
+      server_encrypt_key  — сервер шифрует им сообщения клиенту
     """
     pre_master = client_random[:24] + server_random[:24]
     master_secret = (
@@ -455,10 +457,13 @@ def derive_keys(client_random: bytes, server_random: bytes) -> dict[str, bytes]:
     )
     # Для 128-bit RC4 ([MS-RDPBCGR] 5.3.5.1 — Decryption Key + Encryption Key):
     client_decrypt_key = _final_hash(skb[16:32], client_random, server_random)
+    server_encrypt_key = _final_hash(skb[32:48], client_random, server_random)
     return {
-        "master_secret": master_secret,
-        "session_key_blob": skb,
+        "master_secret":      master_secret,
+        "session_key_blob":   skb,
+        "mac_key":            skb[0:16],
         "client_decrypt_key": client_decrypt_key,  # серверный decrypt = клиентский encrypt
+        "server_encrypt_key": server_encrypt_key,
     }
 
 
@@ -467,6 +472,145 @@ def derive_keys(client_random: bytes, server_random: bytes) -> dict[str, bytes]:
 def rc4_decrypt(key: bytes, data: bytes) -> bytes:
     cipher = Cipher(ARC4(key), mode=None).decryptor()
     return cipher.update(data) + cipher.finalize()
+
+
+def rc4_encrypt(key: bytes, data: bytes) -> bytes:
+    cipher = Cipher(ARC4(key), mode=None).encryptor()
+    return cipher.update(data) + cipher.finalize()
+
+
+# ----------------- MAC ([MS-RDPBCGR] 5.3.6.1) -----------------
+
+_MAC_PAD1 = b"\x36" * 40
+_MAC_PAD2 = b"\x5c" * 48
+
+
+def compute_mac(mac_key: bytes, data: bytes) -> bytes:
+    """Возвращает 8-байтную подпись для отправляемого пакета."""
+    data_len = struct.pack("<I", len(data))
+    sha1_h = sha1(mac_key + _MAC_PAD1 + data_len + data).digest()
+    md5_h  = md5(mac_key + _MAC_PAD2 + sha1_h).digest()
+    return md5_h[:8]
+
+
+# ----------------- Server → Client framing -----------------
+
+# Security header flags
+SEC_EXCHANGE_PKT  = 0x0001
+SEC_ENCRYPT       = 0x0008
+SEC_LICENSE_PKT   = 0x0080
+
+# MCS Send Data Indication choice = 26 → (26 << 2) = 0x68
+_MCS_SEND_DATA_INDICATION = 0x68
+
+# Каналы и UserID, которые наш сервер раздаёт в Attach User Confirm.
+SERVER_USER_ID = 1002
+IO_CHANNEL_ID  = 1003
+
+
+def _per_user_data_length(n: int) -> bytes:
+    """PER length для userData в MCS Send Data Indication."""
+    if n < 0x80:
+        return bytes([n])
+    return bytes([0x80 | ((n >> 8) & 0x7F), n & 0xFF])
+
+
+def build_security_header(
+    payload: bytes,
+    license_pkt: bool,
+    encrypt: bool,
+    mac_key: bytes | None,
+    encrypt_key: bytes | None,
+) -> bytes:
+    """
+    Собрать Security Header + (опц.) MAC + (опц.) RC4-зашифрованный payload.
+    """
+    flags = 0
+    if license_pkt:
+        flags |= SEC_LICENSE_PKT
+    if encrypt:
+        flags |= SEC_ENCRYPT
+    header = struct.pack("<HH", flags, 0)  # flags + flagsHi
+    if encrypt:
+        if not mac_key or not encrypt_key:
+            raise ValueError("encrypt=True требует mac_key и encrypt_key")
+        mac = compute_mac(mac_key, payload)
+        body = rc4_encrypt(encrypt_key, payload)
+        return header + mac + body
+    return header + payload
+
+
+def build_send_data_indication(payload: bytes, channel_id: int = IO_CHANNEL_ID) -> bytes:
+    """MCS Send Data Indication с initiator = SERVER_USER_ID."""
+    return (
+        bytes([_MCS_SEND_DATA_INDICATION])
+        + struct.pack(">H", SERVER_USER_ID)
+        + struct.pack(">H", channel_id)
+        + b"\x70"  # dataPriority=high, segmentation=BEGIN|END
+        + _per_user_data_length(len(payload))
+        + payload
+    )
+
+
+def wrap_tpkt_x224_data(mcs_pdu: bytes) -> bytes:
+    """Обернуть MCS PDU в X.224 Data + TPKT."""
+    x224 = b"\x02\xf0\x80" + mcs_pdu
+    return struct.pack(">BBH", 3, 0, len(x224) + 4) + x224
+
+
+# ----------------- Server License Error PDU ([MS-RDPBCGR] 2.2.1.12) -----------------
+
+# bMsgType
+LICENSE_ERROR_ALERT       = 0xFF
+# bVersion: PREAMBLE_VERSION_3_0
+LICENSE_PREAMBLE_VERSION  = 0x03
+# dwErrorCode
+STATUS_VALID_CLIENT       = 0x00000007
+# dwStateTransition
+ST_NO_TRANSITION          = 0x00000002
+
+
+def build_license_error_valid_client() -> bytes:
+    """
+    Server License Error PDU = STATUS_VALID_CLIENT, ST_NO_TRANSITION.
+    Сигнал клиенту: «лицензия валидна, продолжай к Demand Active».
+    """
+    # bbErrorInfo: пустой blob (type=0, length=0)
+    err_info = struct.pack("<HH", 0x0000, 0x0000)
+    payload  = (
+        struct.pack("<II", STATUS_VALID_CLIENT, ST_NO_TRANSITION)
+        + err_info
+    )
+    # preamble: bMsgType(1) + bVersion(1) + wMsgSize(2, включая preamble)
+    msg_size = 4 + len(payload)
+    preamble = struct.pack(
+        "<BBH",
+        LICENSE_ERROR_ALERT,
+        LICENSE_PREAMBLE_VERSION,
+        msg_size,
+    )
+    return preamble + payload
+
+
+def build_server_license_pdu(
+    encrypt: bool,
+    mac_key: bytes | None = None,
+    encrypt_key: bytes | None = None,
+) -> bytes:
+    """
+    Полный TPKT-фрейм со Server License Error PDU (STATUS_VALID_CLIENT).
+    Если encrypt=True — RC4-шифруется и подписывается MAC'ом.
+    """
+    license_body = build_license_error_valid_client()
+    sec_data     = build_security_header(
+        license_body,
+        license_pkt=True,
+        encrypt=encrypt,
+        mac_key=mac_key,
+        encrypt_key=encrypt_key,
+    )
+    mcs_pdu      = build_send_data_indication(sec_data, channel_id=IO_CHANNEL_ID)
+    return wrap_tpkt_x224_data(mcs_pdu)
 
 
 # ----------------- Client Info PDU -----------------
