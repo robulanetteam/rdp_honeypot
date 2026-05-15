@@ -60,7 +60,7 @@ def load_state() -> dict[str, Any]:
     empty: dict[str, Any] = {
         "offsets": {}, "ip_attempts": {},
         "sessions": {}, "ip_creds": {}, "ip_class": {},
-        "ip_history": {},
+        "ip_history": {}, "ip_logged": {},
     }
     if not STATE_FILE.exists():
         return empty
@@ -196,9 +196,10 @@ def _update_session(sessions: dict, ip: str, port: int, obj: dict) -> None:
 # ── Main processors ───────────────────────────────────────────────────────────
 
 def process_connections(state: dict[str, Any], now: datetime) -> int:
-    offsets  = state.setdefault("offsets", {})
-    sessions = state.setdefault("sessions", {})
-    cutoff   = (now - WINDOW).timestamp()
+    offsets   = state.setdefault("offsets", {})
+    sessions  = state.setdefault("sessions", {})
+    ip_logged = state.setdefault("ip_logged", {})  # ip → last logged bucket (count // EVERY_N)
+    cutoff    = (now - WINDOW).timestamp()
     processed = 0
 
     for obj in iter_new_lines(CONN_JSONL, offsets):
@@ -215,9 +216,14 @@ def process_connections(state: dict[str, Any], now: datetime) -> int:
 
         attempts = state.setdefault("ip_attempts", {}).setdefault(ip, [])
         attempts.append(now.timestamp())
-        count = sum(1 for t in attempts if t >= cutoff)
+        count  = sum(1 for t in attempts if t >= cutoff)
+        bucket = count // EVERY_N
 
-        if count % EVERY_N == 0:
+        # Log only when crossing into a NEW multiple of EVERY_N.
+        # This prevents duplicate entries when several tcp_accepts from the
+        # same IP are processed in a single run (e.g. #3 AND #6 at once).
+        if count % EVERY_N == 0 and bucket > ip_logged.get(ip, 0):
+            ip_logged[ip] = bucket
             ts_str   = now.strftime("%Y-%m-%d %H:%M %z")
             hours    = int(WINDOW.total_seconds() / 3600)
             cls_info = state.get("ip_class", {}).get(ip, {})
@@ -456,13 +462,14 @@ def main() -> int:
     now   = datetime.now(timezone.utc).astimezone()
 
     if args.reprocess:
-        log.info("--reprocess: сброс offsets, sessions, ip_class, ip_creds, ip_history")
+        log.info("--reprocess: сброс offsets, sessions, ip_class, ip_creds, ip_history, ip_logged")
         state["offsets"]     = {}
         state["sessions"]    = {}
         state["ip_class"]    = {}
         state["ip_creds"]    = {}
         state["ip_attempts"] = {}
         state["ip_history"]  = {}
+        state["ip_logged"]   = {}
         # analytics.jsonl — обнуляем, чтобы не было дублей
         if ANALYTICS.exists():
             ANALYTICS.unlink()
