@@ -439,10 +439,14 @@ async def _legacy_state_machine(reader, writer, peer, encrypted: bool, source: s
     requested_channels = 0
     if net and len(net) >= 8:
         requested_channels = struct.unpack("<I", net[4:8])[0]
+    channel_names = legacy.parse_cs_net_channel_names(net) if net else []
+    client_build  = legacy.parse_cs_core_client_build(core) if core else 0
     log_connection(peer, "mcs_connect_initial", {
         "has_core": bool(core),
         "has_security": bool(sec),
         "channels_requested": requested_channels,
+        "channel_names":      channel_names,
+        "client_build":       client_build,
     })
 
     # ---- MCS Connect Response ----

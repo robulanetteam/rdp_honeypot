@@ -558,3 +558,44 @@ def strip_security_header(payload: bytes) -> tuple[int, bytes]:
         # 8 байт data signature
         return flags, payload[12:]
     return flags, payload[4:]
+
+
+# ----------------- MCS Connect Initial parsing helpers -----------------
+
+def parse_cs_net_channel_names(net_block: bytes) -> list[str]:
+    """
+    Extract virtual channel names from CS_NET GCC block.
+    Format (MS-RDPBCGR 2.2.1.3.4):
+        type(2) | length(2) | channelCount(4) | [name(8) + options(4)] * N
+    """
+    if not net_block or len(net_block) < 8:
+        return []
+    try:
+        count = struct.unpack("<I", net_block[4:8])[0]
+        if count > 64 or 8 + count * 12 > len(net_block):
+            return []
+        names = []
+        for i in range(count):
+            off = 8 + i * 12
+            raw = net_block[off : off + 8]
+            name = raw.rstrip(b"\x00").decode("ascii", errors="replace").strip()
+            if name:
+                names.append(name)
+        return names
+    except Exception:
+        return []
+
+
+def parse_cs_core_client_build(core_block: bytes) -> int:
+    """
+    Extract clientBuild from CS_CORE block (MS-RDPBCGR 2.2.1.3.2).
+    Layout: type(2) + length(2) + version(4) + desktopWidth(2) +
+            desktopHeight(2) + colorDepth(2) + SASSeq(2) +
+            keyboardLayout(4) + clientBuild(4) → offset 20.
+    """
+    if not core_block or len(core_block) < 24:
+        return 0
+    try:
+        return struct.unpack("<I", core_block[20:24])[0]
+    except Exception:
+        return 0

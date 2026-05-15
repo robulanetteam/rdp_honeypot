@@ -161,6 +161,7 @@ def _update_session(sessions: dict, ip: str, port: int, obj: dict) -> None:
             "stages": [], "requested_protocols": 0,
             "cookie": "", "errors": [], "selected": None,
             "has_credentials": False,
+            "channel_names": [], "client_build": 0,
             "first_ts": ts, "last_ts": ts,
         }
 
@@ -181,6 +182,11 @@ def _update_session(sessions: dict, ip: str, port: int, obj: dict) -> None:
         err = obj.get("error", "")
         if err and err not in sess["errors"]:
             sess["errors"].append(err)
+    elif stage == "mcs_connect_initial":
+        if not sess.get("channel_names"):  # keep first seen value per session
+            sess["channel_names"] = obj.get("channel_names", [])
+        if not sess.get("client_build"):
+            sess["client_build"] = obj.get("client_build", 0)
 
 
 # ── Main processors ───────────────────────────────────────────────────────────
@@ -285,6 +291,8 @@ def run_analytics(state: dict[str, Any], now: datetime) -> None:
                 has_credentials=sess.get("has_credentials", False) or ip_creds.get(ip, False),
                 first_ts=sess.get("first_ts", 0.0),
                 last_ts=sess.get("last_ts", 0.0),
+                channel_names=sess.get("channel_names", []),
+                client_build=sess.get("client_build", 0),
             )
         )
 
@@ -319,6 +327,7 @@ def run_analytics(state: dict[str, Any], now: datetime) -> None:
                 "classification": analysis.classification,
                 "confidence":     analysis.confidence,
                 "reasons":        analysis.reasons,
+                "cve_hints":      analysis.cve_hints,
                 "sessions_total": analysis.sessions_total,
                 "protocols_seen": analysis.protocols_seen,
                 "has_credentials": analysis.has_credentials,

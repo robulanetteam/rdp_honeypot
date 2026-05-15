@@ -53,6 +53,8 @@ class SessionInfo:
     has_credentials: bool = False
     first_ts: float = 0.0
     last_ts: float = 0.0
+    channel_names: list[str] = field(default_factory=list)  # CS_NET virtual channels
+    client_build: int = 0                                    # CS_CORE clientBuild
 
 
 @dataclass
@@ -64,6 +66,64 @@ class IpAnalysis:
     sessions_total: int
     protocols_seen: list[str]
     has_credentials: bool
+    cve_hints: list[str] = field(default_factory=list)
+
+
+# ── CVE fingerprints ─────────────────────────────────────────────────────────
+
+# Channel names that legitimate RDP clients NEVER request.
+# Their presence in CS_NET is an exploit fingerprint.
+_CVE_CHANNEL_SIGS: dict[str, str] = {
+    "MS_T120": "CVE-2019-0708:BlueKeep",    # BlueKeep — kernel pool spray via MS_T120
+}
+
+# clientBuild values used by known PoC / framework tools (0 = unset, tool forgot to fill)
+_EXPLOIT_CLIENT_BUILDS: dict[int, str] = {
+    0x00000000: "client_build:0",            # uninitialized — common in PoCs
+    0x00000A28: "client_build:Metasploit",   # Metasploit RDP module default (0x0A28)
+}
+
+
+def detect_cve_hints(sessions: list[SessionInfo]) -> list[str]:
+    """
+    Return list of CVE / anomaly strings detected across all sessions from one IP.
+    Called from classify_ip() — results go into IpAnalysis.cve_hints and reasons.
+    """
+    hits: list[str] = []
+    seen: set[str] = set()
+
+    all_channels: set[str] = set()
+    for s in sessions:
+        all_channels.update(s.channel_names)
+
+    # Channel-name fingerprinting
+    for channel, cve_label in _CVE_CHANNEL_SIGS.items():
+        if channel in all_channels and cve_label not in seen:
+            hits.append(cve_label)
+            seen.add(cve_label)
+
+    # Anomalous channel count (legitimate clients use 3–10)
+    max_ch = max((len(s.channel_names) for s in sessions if s.channel_names), default=0)
+    if max_ch > 30:
+        label = f"anomalous_channel_count:{max_ch}"
+        if label not in seen:
+            hits.append(label)
+            seen.add(label)
+    elif max_ch > 20:
+        label = f"high_channel_count:{max_ch}"
+        if label not in seen:
+            hits.append(label)
+            seen.add(label)
+
+    # PoC / exploit tool fingerprint via clientBuild
+    for s in sessions:
+        if s.client_build in _EXPLOIT_CLIENT_BUILDS:
+            label = _EXPLOIT_CLIENT_BUILDS[s.client_build]
+            if label not in seen:
+                hits.append(label)
+                seen.add(label)
+
+    return hits
 
 
 def classify_ip(sessions: list[SessionInfo]) -> IpAnalysis:
@@ -75,6 +135,14 @@ def classify_ip(sessions: list[SessionInfo]) -> IpAnalysis:
     n = len(sessions)
     scanner_score = 0
     brute_score = 0
+
+    # ─── CVE fingerprinting ──────────────────────────────────────────
+    cve_hints = detect_cve_hints(sessions)
+    if cve_hints:
+        # Each confirmed CVE fingerprint is a strong scanner signal
+        cve_count = sum(1 for h in cve_hints if h.startswith("CVE-"))
+        scanner_score += 8 * cve_count
+        reasons.extend(cve_hints)
 
     # ─── Scanner signals ────────────────────────────────────────────
     for s in sessions:
@@ -152,6 +220,7 @@ def classify_ip(sessions: list[SessionInfo]) -> IpAnalysis:
         sessions_total=n,
         protocols_seen=protocols,
         has_credentials=has_creds,
+        cve_hints=cve_hints,
     )
 
 
