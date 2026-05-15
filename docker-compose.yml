@@ -35,6 +35,17 @@ services:
       - ./data/logs:/data/logs          # JSONL события + cert
       - ./data/public:/data/public      # публичный лог (раздавать через nginx/caddy)
       - ./data/private:/data/private    # пароли/хэши (chmod 0700 на хосте)
+      # Python-исходники монтируются поверх запечённых в образ файлов.
+      # git pull + docker compose restart — достаточно для обновления кода
+      # без пересборки образа. Пересборка нужна только при изменении
+      # Dockerfile или requirements.txt.
+      - ./honeypot/honeypot.py:/app/honeypot.py:ro
+      - ./honeypot/rdp_protocol.py:/app/rdp_protocol.py:ro
+      - ./honeypot/rdp_legacy.py:/app/rdp_legacy.py:ro
+      - ./honeypot/ntlm.py:/app/ntlm.py:ro
+      - ./honeypot/ts_signing_key.py:/app/ts_signing_key.py:ro
+      - ./scripts/log_processor.py:/app/log_processor.py:ro
+      - ./scripts/classifier.py:/app/classifier.py:ro
     security_opt:
       - no-new-privileges:true
     cap_drop:
