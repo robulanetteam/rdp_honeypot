@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 _SCANNER_RE = re.compile(
@@ -226,6 +227,62 @@ def classify_ip(sessions: list[SessionInfo]) -> IpAnalysis:
         has_credentials=has_creds,
         cve_hints=cve_hints,
     )
+
+
+# ── Threat scoring (scope) ────────────────────────────────────────────────────
+
+#: Базовый балл по типу угрозы (до применения множителя confidence)
+_CLS_BASE: dict[str, int] = {
+    "bruteforcer": 50,
+    "scanner":     30,
+    "accidental":   0,
+    "unknown":      5,
+}
+
+#: Множитель уверенности
+_CONF_MULT: dict[str, float] = {
+    "high":   1.0,
+    "medium": 0.7,
+    "low":    0.4,
+}
+
+
+def compute_scope(
+    classification: str,
+    confidence: str,
+    threat_days_count: int,
+) -> int:
+    """
+    Рейтинг угрозы IP: 0–100.
+
+      base       = _CLS_BASE[cls] * _CONF_MULT[conf]   (0–50)
+      days_bonus = min(threat_days * 5, 50)             (0–50)
+
+    scope >= 70  →  блокировка 60 дней
+    scope >= 50  →  блокировка 30 дней
+    scope >= 30  →  блокировка  7 дней
+    scope <  30  →  без блокировки
+    """
+    base       = _CLS_BASE.get(classification, 5) * _CONF_MULT.get(confidence, 0.5)
+    days_bonus = min(threat_days_count * 5, 50)
+    return min(100, int(base + days_bonus))
+
+
+def compute_block_until(scope: int, last_seen_ts: float) -> Optional[str]:
+    """
+    Дата окончания блокировки по рейтингу угрозы.
+    Возвращает ISO-8601 строку или None (блокировка не нужна).
+    """
+    if scope >= 70:
+        days = 60
+    elif scope >= 50:
+        days = 30
+    elif scope >= 30:
+        days = 7
+    else:
+        return None
+    dt = datetime.fromtimestamp(last_seen_ts, tz=timezone.utc) + timedelta(days=days)
+    return dt.isoformat()
 
 
 # ── Subnet correlation ────────────────────────────────────────────────────────

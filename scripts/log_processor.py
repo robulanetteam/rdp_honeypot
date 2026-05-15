@@ -24,7 +24,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from classifier import SessionInfo, IpAnalysis, classify_ip, correlate_subnet_scan
+from classifier import (
+    SessionInfo, IpAnalysis, classify_ip, correlate_subnet_scan,
+    compute_scope, compute_block_until,
+)
 
 LOG_DIR      = Path(os.environ.get("HONEYPOT_LOG_DIR", "/var/log/honeypot"))
 CONN_JSONL   = LOG_DIR / "connections.jsonl"
@@ -57,6 +60,7 @@ def load_state() -> dict[str, Any]:
     empty: dict[str, Any] = {
         "offsets": {}, "ip_attempts": {},
         "sessions": {}, "ip_creds": {}, "ip_class": {},
+        "ip_history": {},
     }
     if not STATE_FILE.exists():
         return empty
@@ -272,6 +276,8 @@ def run_analytics(state: dict[str, Any], now: datetime) -> None:
     sessions_state = state.get("sessions", {})
     ip_creds = state.get("ip_creds", {})
     ip_class = state.setdefault("ip_class", {})
+    ip_history = state.setdefault("ip_history", {})
+    today_str = now.date().isoformat()
 
     # Группируем сессии по IP
     by_ip: dict[str, list[SessionInfo]] = {}
@@ -315,6 +321,23 @@ def run_analytics(state: dict[str, Any], now: datetime) -> None:
                 analysis.classification = "scanner"
                 analysis.confidence = "medium"
 
+        # ── ip_history: накапливаем threat-дни, вычисляем scope/block_until ────
+        is_threat = analysis.classification in ("scanner", "bruteforcer")
+        hist = ip_history.setdefault(ip, {"first_seen": last_ts, "threat_days": []})
+        if is_threat:
+            if today_str not in hist["threat_days"]:
+                hist["threat_days"].append(today_str)
+            hist.setdefault("first_seen", last_ts)
+            hist["last_seen"]           = last_ts
+            hist["last_classification"] = analysis.classification
+            hist["last_confidence"]     = analysis.confidence
+
+        threat_days_count = len(hist.get("threat_days", []))
+        scope       = compute_scope(analysis.classification, analysis.confidence, threat_days_count)
+        block_until = compute_block_until(scope, last_ts) if last_ts > 0 else None
+        hist["scope"]       = scope
+        hist["block_until"] = block_until
+
         prev         = ip_class.get(ip, {})
         prev_reasons = prev.get("reasons", [])
         changed      = (
@@ -324,33 +347,83 @@ def run_analytics(state: dict[str, Any], now: datetime) -> None:
                 "subnet_coordinated_scan" in analysis.reasons
                 and "subnet_coordinated_scan" not in prev_reasons
             )
+            or abs(scope - prev.get("scope", 0)) >= 10
         )
         if changed:
+            first_seen_ts  = hist.get("first_seen", last_ts)
+            first_seen_str = (
+                datetime.fromtimestamp(first_seen_ts, tz=timezone.utc).astimezone().isoformat()
+                if first_seen_ts else ip_str
+            )
             entry = {
-                "timestamp":      ip_str,
-                "source_ip":      ip,
-                "classification": analysis.classification,
-                "confidence":     analysis.confidence,
-                "reasons":        analysis.reasons,
-                "cve_hints":      analysis.cve_hints,
-                "sessions_total": analysis.sessions_total,
-                "protocols_seen": analysis.protocols_seen,
+                "timestamp":       ip_str,
+                "source_ip":       ip,
+                "classification":  analysis.classification,
+                "confidence":      analysis.confidence,
+                "reasons":         analysis.reasons,
+                "cve_hints":       analysis.cve_hints,
+                "sessions_total":  analysis.sessions_total,
+                "protocols_seen":  analysis.protocols_seen,
                 "has_credentials": analysis.has_credentials,
+                "scope":           scope,
+                "block_until":     block_until,
+                "threat_days":     threat_days_count,
+                "first_seen":      first_seen_str,
             }
             append_analytics(entry)
             log.info(
-                "Classification %s → %s [%s] %s",
+                "Classification %s → %s [%s] scope=%d days=%d %s",
                 ip, analysis.classification, analysis.confidence,
-                ",".join(analysis.reasons),
+                scope, threat_days_count, ",".join(analysis.reasons),
             )
         ip_class[ip] = {
             "classification": analysis.classification,
             "confidence":     analysis.confidence,
             "reasons":        analysis.reasons,
             "sessions_total": analysis.sessions_total,
+            "scope":          scope,
+            "block_until":    block_until,
             "updated_ts":     now.timestamp(),
         }
 
+# ── Blocklist export ───────────────────────────────────────────────────────
+
+def write_blocklist(state: dict[str, Any], now: datetime) -> None:
+    """Записать актуальный blocklist в MIRROR_DIR (plain + JSON)."""
+    ip_history = state.get("ip_history", {})
+    now_ts = now.timestamp()
+    active: list[dict] = []
+
+    for ip, hist in ip_history.items():
+        block_until = hist.get("block_until")
+        scope       = hist.get("scope", 0)
+        if not block_until or scope < 30:
+            continue
+        try:
+            block_until_ts = datetime.fromisoformat(block_until).timestamp()
+        except (ValueError, TypeError):
+            continue
+        if block_until_ts <= now_ts:
+            continue
+        active.append({
+            "ip":             ip,
+            "scope":          scope,
+            "block_until":    block_until,
+            "classification": hist.get("last_classification", "unknown"),
+            "threat_days":    len(hist.get("threat_days", [])),
+        })
+
+    active.sort(key=lambda x: (-x["scope"], x["ip"]))
+
+    MIRROR_DIR.mkdir(parents=True, exist_ok=True)
+    (MIRROR_DIR / "blocklist.txt").write_text(
+        "\n".join(r["ip"] for r in active) + ("\n" if active else ""),
+        encoding="utf-8",
+    )
+    (MIRROR_DIR / "blocklist.json").write_text(
+        json.dumps(active, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -383,12 +456,13 @@ def main() -> int:
     now   = datetime.now(timezone.utc).astimezone()
 
     if args.reprocess:
-        log.info("--reprocess: сброс offsets, sessions, ip_class, ip_creds")
+        log.info("--reprocess: сброс offsets, sessions, ip_class, ip_creds, ip_history")
         state["offsets"]     = {}
         state["sessions"]    = {}
         state["ip_class"]    = {}
         state["ip_creds"]    = {}
         state["ip_attempts"] = {}
+        state["ip_history"]  = {}
         # analytics.jsonl — обнуляем, чтобы не было дублей
         if ANALYTICS.exists():
             ANALYTICS.unlink()
@@ -404,6 +478,7 @@ def main() -> int:
     n_cred = process_credentials(state)
     n_conn = process_connections(state, now)
     run_analytics(state, now)
+    write_blocklist(state, now)
     save_state(state)
 
     log.info("Обработано: connections=%d credentials=%d", n_conn, n_cred)
