@@ -1,0 +1,149 @@
+"""
+RDP Honeypot — классификатор подключений.
+
+Категории:
+  scanner      — автоматический сканер/разведчик (nmap, masscan, zgrab, Shodan...)
+  bruteforcer  — подбор паролей (дошёл до legacy RDP или получил учётные данные)
+  accidental   — разовый клиент без признаков злоумысла
+  unknown      — недостаточно данных для уверенной классификации
+
+Сигналы:
+
+  Scanner:
+    +5  cookie содержит имя известного сканера (nmap, masscan, zgrab...)
+    +3  TPKT exception — прямой TLS-зонд (байт 0x16), не RDP
+    +3  HYBRID_EX bit (0x08) в requested_protocols — признак автоматизированного клиента
+    +2  ≥3 соединений с одного IP за <120 сек
+    +1  >2 разных значений requested_protocols от одного IP
+
+  Bruteforcer:
+    +10 учётные данные захвачены
+    +5  сессия дошла до x224_cc: RDP_LEGACY
+    +3  downgrade_requested, а затем retry с PROTOCOL_RDP
+    +2  ≥5 сессий от одного IP
+
+  Accidental:
+    n=1, нет legacy, нет учётных данных, scanner_score=0
+
+Решение: max(scanner_score, brute_score) определяет класс.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Optional
+
+_SCANNER_RE = re.compile(
+    r"nmap|masscan|zmap|zgrab|rdpscan|metasploit|shodan|censys|nuclei"
+    r"|stretchoid|internetmeasurement|alphasoc|mirai",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class SessionInfo:
+    ip: str
+    port: int
+    stages: list[str] = field(default_factory=list)
+    requested_protocols: int = 0
+    cookie: str = ""
+    errors: list[str] = field(default_factory=list)
+    selected: Optional[str] = None  # RDP_LEGACY | SSL | HYBRID
+    has_credentials: bool = False
+    first_ts: float = 0.0
+    last_ts: float = 0.0
+
+
+@dataclass
+class IpAnalysis:
+    ip: str
+    classification: str   # scanner / bruteforcer / accidental / unknown
+    confidence: str       # high / medium / low
+    reasons: list[str]
+    sessions_total: int
+    protocols_seen: list[str]
+    has_credentials: bool
+
+
+def classify_ip(sessions: list[SessionInfo]) -> IpAnalysis:
+    """Classify all known sessions from one IP address."""
+    reasons: list[str] = []
+    protocols = sorted({s.selected for s in sessions if s.selected})
+    has_creds = any(s.has_credentials for s in sessions)
+    reached_legacy = any(s.selected == "RDP_LEGACY" for s in sessions)
+    n = len(sessions)
+    scanner_score = 0
+    brute_score = 0
+
+    # ─── Scanner signals ────────────────────────────────────────────
+    for s in sessions:
+        if s.cookie and _SCANNER_RE.search(s.cookie):
+            scanner_score += 5
+            reasons.append(f"scanner_cookie:{s.cookie!r}")
+            break
+
+    for s in sessions:
+        if any("TPKT" in e for e in s.errors):
+            scanner_score += 3
+            reasons.append("tls_direct_probe")
+            break
+
+    # HYBRID_EX bit (0x08) — автоматизированный современный клиент (Shodan, Censys)
+    for s in sessions:
+        if s.requested_protocols & 0x08:
+            scanner_score += 3
+            reasons.append("hybrid_ex_protocol")
+            break
+
+    # Множество быстрых соединений
+    ts_list = sorted(s.first_ts for s in sessions if s.first_ts > 0)
+    if len(ts_list) >= 3 and (ts_list[-1] - ts_list[0]) < 120:
+        scanner_score += 2
+        reasons.append(
+            f"rapid_multiconn:{len(ts_list)}x_in_{ts_list[-1] - ts_list[0]:.0f}s"
+        )
+
+    # Разные значения requested_protocols
+    if len({s.requested_protocols for s in sessions}) > 2:
+        scanner_score += 1
+        reasons.append("multi_proto_variants")
+
+    # ─── Bruteforcer signals ─────────────────────────────────────────
+    if has_creds:
+        brute_score += 10
+        reasons.append("credentials_captured")
+
+    if reached_legacy:
+        brute_score += 5
+        reasons.append("reached_rdp_legacy")
+
+    had_downgrade = any("downgrade_requested" in s.stages for s in sessions)
+    if had_downgrade and reached_legacy:
+        brute_score += 3
+        reasons.append("downgrade_then_legacy_retry")
+
+    if n >= 5:
+        brute_score += 2
+        reasons.append(f"high_session_count:{n}")
+
+    # ─── Decision ────────────────────────────────────────────────────
+    if scanner_score >= max(brute_score, 3):
+        cls, conf = "scanner", "high" if scanner_score >= 5 else "medium"
+    elif brute_score >= 5:
+        cls, conf = "bruteforcer", "high" if has_creds else "medium"
+    elif n == 1 and not reached_legacy and not has_creds and scanner_score == 0:
+        cls, conf = "accidental", "medium"
+    else:
+        cls, conf = "unknown", "low"
+        if not reasons:
+            reasons.append("insufficient_data")
+
+    return IpAnalysis(
+        ip=sessions[0].ip,
+        classification=cls,
+        confidence=conf,
+        reasons=reasons,
+        sessions_total=n,
+        protocols_seen=protocols,
+        has_credentials=has_creds,
+    )

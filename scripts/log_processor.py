@@ -2,19 +2,18 @@
 """
 RDP Honeypot log processor.
 
-Парсит JSONL-логи самописного listener (honeypot.py):
-  - data/logs/connections.jsonl
-  - data/logs/credentials.jsonl
+Парсит JSONL-логи honeypot.py:
+  - data/logs/connections.jsonl   — события соединений
+  - data/logs/credentials.jsonl  — захваченные учётные данные
 
 Делает:
-  * считает уникальные попытки от каждого IP за окно WINDOW_HOURS (по умолч. 24ч)
-  * каждое N-е (по умолч. 3-е) подключение → публичный лог на зеркале
-  * пары login/password (NetNTLM hash) → приватный лог /var/log/...
+  * каждое N-е подключение от IP → публичный лог
+  * credentials → приватный лог
+  * классифицирует каждый IP: scanner / bruteforcer / accidental / unknown
+    результат → data/logs/analytics.jsonl (пишется при изменении класса)
 
-Запускается systemd-таймером раз в минуту. Состояние — state.json рядом с
-JSONL-логами; учитываются offset'ы файлов для идемпотентности.
+Запускается supervisord (log_loop.sh) раз в минуту.
 """
-
 from __future__ import annotations
 
 import json
@@ -25,35 +24,47 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-LOG_DIR = Path(os.environ.get("HONEYPOT_LOG_DIR", "/var/log/honeypot"))
-CONN_JSONL = LOG_DIR / "connections.jsonl"
-CRED_JSONL = LOG_DIR / "credentials.jsonl"
-STATE_FILE = LOG_DIR / "state.json"
+from classifier import SessionInfo, IpAnalysis, classify_ip
 
-MIRROR_DIR = Path(os.environ.get("MIRROR_DIR", "/srv/http/update"))
-PUBLIC_LOG = MIRROR_DIR / os.environ.get("PUBLIC_LOG_NAME", "rdp_honeypot.txt")
-PRIVATE_LOG = Path(
-    os.environ.get("PRIVATE_LOG", "/var/log/rdp_honeypot_credentials.log")
-)
+LOG_DIR      = Path(os.environ.get("HONEYPOT_LOG_DIR", "/var/log/honeypot"))
+CONN_JSONL   = LOG_DIR / "connections.jsonl"
+CRED_JSONL   = LOG_DIR / "credentials.jsonl"
+ANALYTICS    = LOG_DIR / "analytics.jsonl"
+STATE_FILE   = LOG_DIR / "state.json"
 
-EVERY_N = int(os.environ.get("PUBLIC_LOG_EVERY_N", "3"))
-WINDOW = timedelta(hours=int(os.environ.get("WINDOW_HOURS", "24")))
+MIRROR_DIR   = Path(os.environ.get("MIRROR_DIR", "/srv/http/update"))
+PUBLIC_LOG   = MIRROR_DIR / os.environ.get("PUBLIC_LOG_NAME", "rdp_honeypot.txt")
+PRIVATE_LOG  = Path(os.environ.get("PRIVATE_LOG", "/var/log/rdp_honeypot_credentials.log"))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+EVERY_N  = int(os.environ.get("PUBLIC_LOG_EVERY_N", "3"))
+WINDOW   = timedelta(hours=int(os.environ.get("WINDOW_HOURS", "24")))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("rdp-honeypot")
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _parse_ts(ts_str: str) -> float:
+    """ISO-8601 → POSIX float. Returns 0.0 on failure."""
+    try:
+        return datetime.fromisoformat(ts_str).timestamp()
+    except (ValueError, TypeError, AttributeError):
+        return 0.0
+
+
 def load_state() -> dict[str, Any]:
+    empty: dict[str, Any] = {
+        "offsets": {}, "ip_attempts": {},
+        "sessions": {}, "ip_creds": {}, "ip_class": {},
+    }
     if not STATE_FILE.exists():
-        return {"offsets": {}, "ip_attempts": {}}
+        return empty
     try:
         return json.loads(STATE_FILE.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         log.warning("state.json повреждён (%s), сбрасываем", exc)
-        return {"offsets": {}, "ip_attempts": {}}
+        return empty
 
 
 def save_state(state: dict[str, Any]) -> None:
@@ -62,14 +73,26 @@ def save_state(state: dict[str, Any]) -> None:
     tmp.replace(STATE_FILE)
 
 
-def prune_ip_attempts(state: dict[str, Any], now: datetime) -> None:
+def prune_old(state: dict[str, Any], now: datetime) -> None:
     cutoff = (now - WINDOW).timestamp()
-    new: dict[str, list[float]] = {}
-    for ip, timestamps in state.get("ip_attempts", {}).items():
-        recent = [t for t in timestamps if t >= cutoff]
-        if recent:
-            new[ip] = recent
-    state["ip_attempts"] = new
+
+    # ip_attempts
+    state["ip_attempts"] = {
+        ip: [t for t in ts if t >= cutoff]
+        for ip, ts in state.get("ip_attempts", {}).items()
+        if any(t >= cutoff for t in ts)
+    }
+    # sessions
+    state["sessions"] = {
+        k: v for k, v in state.get("sessions", {}).items()
+        if v.get("last_ts", 0) >= cutoff
+    }
+    # ip_class — прунить только IPs без активных сессий
+    active_ips = {v["ip"] for v in state["sessions"].values()}
+    state["ip_class"] = {
+        ip: v for ip, v in state.get("ip_class", {}).items()
+        if ip in active_ips
+    }
 
 
 def iter_new_lines(path: Path, offsets: dict[str, int]):
@@ -119,29 +142,78 @@ def append_private(line: str) -> None:
         pass
 
 
+def append_analytics(obj: dict) -> None:
+    ANALYTICS.parent.mkdir(parents=True, exist_ok=True)
+    with ANALYTICS.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+# ── Session accumulation ──────────────────────────────────────────────────────
+
+def _update_session(sessions: dict, ip: str, port: int, obj: dict) -> None:
+    key = f"{ip}:{port}"
+    stage = obj.get("stage", "")
+    ts = _parse_ts(obj.get("timestamp", ""))
+
+    if stage == "tcp_accept" or key not in sessions:
+        sessions[key] = {
+            "ip": ip, "port": port,
+            "stages": [], "requested_protocols": 0,
+            "cookie": "", "errors": [], "selected": None,
+            "has_credentials": False,
+            "first_ts": ts, "last_ts": ts,
+        }
+
+    sess = sessions[key]
+    if stage and stage not in sess["stages"]:
+        sess["stages"].append(stage)
+    sess["last_ts"] = max(sess.get("last_ts", 0), ts)
+
+    if stage == "x224_cr":
+        proto = obj.get("requested_protocols", "0x0")
+        sess["requested_protocols"] = (
+            int(proto, 16) if isinstance(proto, str) else int(proto)
+        )
+        sess["cookie"] = obj.get("cookie") or ""
+    elif stage == "x224_cc":
+        sess["selected"] = obj.get("selected")
+    elif stage == "exception":
+        err = obj.get("error", "")
+        if err and err not in sess["errors"]:
+            sess["errors"].append(err)
+
+
+# ── Main processors ───────────────────────────────────────────────────────────
+
 def process_connections(state: dict[str, Any], now: datetime) -> int:
-    """Каждое N-е подключение от одного IP → публичный лог."""
-    offsets = state.setdefault("offsets", {})
-    cutoff = (now - WINDOW).timestamp()
+    offsets  = state.setdefault("offsets", {})
+    sessions = state.setdefault("sessions", {})
+    cutoff   = (now - WINDOW).timestamp()
     processed = 0
 
     for obj in iter_new_lines(CONN_JSONL, offsets):
         processed += 1
-        # Учитываем ТОЛЬКО факт принятого TCP/X.224 — не каждую стадию,
-        # чтобы один клиент не давал нам 5 событий за одно соединение.
-        if obj.get("stage") not in ("tcp_accept",):
+        ip   = obj.get("source_ip")
+        port = obj.get("source_port")
+        if not ip or not port:
             continue
-        src = obj.get("source_ip")
-        if not src:
+
+        _update_session(sessions, ip, port, obj)
+
+        if obj.get("stage") != "tcp_accept":
             continue
-        attempts = state.setdefault("ip_attempts", {}).setdefault(src, [])
+
+        attempts = state.setdefault("ip_attempts", {}).setdefault(ip, [])
         attempts.append(now.timestamp())
         count = sum(1 for t in attempts if t >= cutoff)
 
         if count % EVERY_N == 0:
-            ts = now.strftime("%Y-%m-%d %H:%M:%S %z")
-            hours = int(WINDOW.total_seconds() / 3600)
-            line = f"{ts} | {src} | attempt #{count} in last {hours}h"
+            ts_str   = now.strftime("%Y-%m-%d %H:%M %z")
+            hours    = int(WINDOW.total_seconds() / 3600)
+            cls_info = state.get("ip_class", {}).get(ip, {})
+            cls_tag  = cls_info.get("classification", "")
+            cls_str  = f" | {cls_tag}" if cls_tag else ""
+            line     = f"{ts_str} | {ip} | attempt #{count} in last {hours}h{cls_str}"
             append_public(line)
             log.info("Public log: %s", line)
 
@@ -149,26 +221,34 @@ def process_connections(state: dict[str, Any], now: datetime) -> int:
 
 
 def process_credentials(state: dict[str, Any]) -> int:
-    """Все credential events → приватный лог."""
-    offsets = state.setdefault("offsets", {})
+    offsets  = state.setdefault("offsets", {})
+    ip_creds = state.setdefault("ip_creds", {})
+    sessions = state.setdefault("sessions", {})
     processed = 0
+
     for obj in iter_new_lines(CRED_JSONL, offsets):
         processed += 1
-        ts = obj.get("timestamp", "?")
-        src = obj.get("source_ip", "?")
-        via = obj.get("captured_via", "?")
+        src  = obj.get("source_ip", "?")
+        via  = obj.get("captured_via", "?")
         user = obj.get("username", "")
         domain = obj.get("domain", "")
         workstation = obj.get("workstation", "")
         password = obj.get("password")
-        hashcat = obj.get("hashcat", "")
+        hashcat  = obj.get("hashcat", "")
+        ts = obj.get("timestamp", "?")
+
+        ip_creds[src] = True
+        for sess in sessions.values():
+            if sess.get("ip") == src:
+                sess["has_credentials"] = True
+
         if password:
             line = (
                 f"{ts} | src={src} | via={via} | "
                 f"domain={domain!r} user={user!r} password={password!r}"
             )
         else:
-            ver = obj.get("ntlm_version", "?")
+            ver  = obj.get("ntlm_version", "?")
             line = (
                 f"{ts} | src={src} | via={via} | "
                 f"domain={domain!r} user={user!r} workstation={workstation!r} "
@@ -177,19 +257,85 @@ def process_credentials(state: dict[str, Any]) -> int:
         append_private(line)
         log.info("Credential captured (src=%s via=%s user=%r %s)",
                  src, via, user, "PLAINTEXT" if password else "hash-only")
+
     return processed
 
+
+def run_analytics(state: dict[str, Any], now: datetime) -> None:
+    """Классифицировать каждый IP. Записать analytics.jsonl при изменении класса."""
+    sessions_state = state.get("sessions", {})
+    ip_creds = state.get("ip_creds", {})
+    ip_class = state.setdefault("ip_class", {})
+
+    # Группируем сессии по IP
+    by_ip: dict[str, list[SessionInfo]] = {}
+    for sess in sessions_state.values():
+        ip = sess.get("ip", "")
+        if not ip:
+            continue
+        by_ip.setdefault(ip, []).append(
+            SessionInfo(
+                ip=ip,
+                port=sess.get("port", 0),
+                stages=sess.get("stages", []),
+                requested_protocols=sess.get("requested_protocols", 0),
+                cookie=sess.get("cookie", ""),
+                errors=sess.get("errors", []),
+                selected=sess.get("selected"),
+                has_credentials=sess.get("has_credentials", False) or ip_creds.get(ip, False),
+                first_ts=sess.get("first_ts", 0.0),
+                last_ts=sess.get("last_ts", 0.0),
+            )
+        )
+
+    now_str = now.isoformat()
+    for ip, sessions in by_ip.items():
+        analysis = classify_ip(sessions)
+        prev     = ip_class.get(ip, {})
+        changed  = (
+            prev.get("classification") != analysis.classification
+            or prev.get("confidence") != analysis.confidence
+        )
+        if changed:
+            entry = {
+                "timestamp":      now_str,
+                "source_ip":      ip,
+                "classification": analysis.classification,
+                "confidence":     analysis.confidence,
+                "reasons":        analysis.reasons,
+                "sessions_total": analysis.sessions_total,
+                "protocols_seen": analysis.protocols_seen,
+                "has_credentials": analysis.has_credentials,
+            }
+            append_analytics(entry)
+            log.info(
+                "Classification %s → %s [%s] %s",
+                ip, analysis.classification, analysis.confidence,
+                ",".join(analysis.reasons),
+            )
+        ip_class[ip] = {
+            "classification": analysis.classification,
+            "confidence":     analysis.confidence,
+            "reasons":        analysis.reasons,
+            "sessions_total": analysis.sessions_total,
+            "updated_ts":     now.timestamp(),
+        }
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> int:
     if not LOG_DIR.exists():
         log.error("Каталог логов %s не существует", LOG_DIR)
         return 1
-    state = load_state()
-    now = datetime.now(timezone.utc).astimezone()
-    prune_ip_attempts(state, now)
 
-    n_conn = process_connections(state, now)
+    state = load_state()
+    now   = datetime.now(timezone.utc).astimezone()
+    prune_old(state, now)
+
     n_cred = process_credentials(state)
+    n_conn = process_connections(state, now)
+    run_analytics(state, now)
     save_state(state)
 
     log.info("Обработано: connections=%d credentials=%d", n_conn, n_cred)

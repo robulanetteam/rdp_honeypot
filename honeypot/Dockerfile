@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY honeypot/honeypot.py honeypot/rdp_protocol.py honeypot/ntlm.py \
      honeypot/rdp_legacy.py honeypot/ts_signing_key.py ./
 COPY scripts/log_processor.py ./log_processor.py
+COPY scripts/classifier.py ./classifier.py
 COPY honeypot/log_loop.sh ./log_loop.sh
 COPY honeypot/supervisord.conf ./supervisord.conf
 
