@@ -403,7 +403,7 @@ def write_blocklist(state: dict[str, Any], now: datetime) -> None:
     for ip, hist in ip_history.items():
         block_until = hist.get("block_until")
         scope       = hist.get("scope", 0)
-        if not block_until or scope < 30:
+        if not block_until or scope < 25:
             continue
         try:
             block_until_ts = datetime.fromisoformat(block_until).timestamp()

@@ -145,8 +145,10 @@ def classify_ip(sessions: list[SessionInfo]) -> IpAnalysis:
     cve_hints = detect_cve_hints(sessions)
     if cve_hints:
         # Each confirmed CVE fingerprint is a strong scanner signal
-        cve_count = sum(1 for h in cve_hints if h.startswith("CVE-"))
+        cve_count     = sum(1 for h in cve_hints if h.startswith("CVE-"))
+        exploit_count = sum(1 for h in cve_hints if h.startswith("client_build:"))
         scanner_score += 8 * cve_count
+        scanner_score += 6 * exploit_count   # PoC/framework tool fingerprint
         reasons.extend(cve_hints)
 
     # ─── Scanner signals ────────────────────────────────────────────
@@ -234,7 +236,7 @@ def classify_ip(sessions: list[SessionInfo]) -> IpAnalysis:
 #: Базовый балл по типу угрозы (до применения множителя confidence)
 _CLS_BASE: dict[str, int] = {
     "bruteforcer": 50,
-    "scanner":     30,
+    "scanner":     35,   # было 30; подняли чтобы scanner/high day1 = 35
     "accidental":   0,
     "unknown":      5,
 }
@@ -260,8 +262,8 @@ def compute_scope(
 
     scope >= 70  →  блокировка 60 дней
     scope >= 50  →  блокировка 30 дней
-    scope >= 30  →  блокировка  7 дней
-    scope <  30  →  без блокировки
+    scope >= 25  →  блокировка  7 дней
+    scope <  25  →  без блокировки
     """
     base       = _CLS_BASE.get(classification, 5) * _CONF_MULT.get(confidence, 0.5)
     days_bonus = min(threat_days_count * 5, 50)
@@ -277,7 +279,7 @@ def compute_block_until(scope: int, last_seen_ts: float) -> Optional[str]:
         days = 60
     elif scope >= 50:
         days = 30
-    elif scope >= 30:
+    elif scope >= 25:
         days = 7
     else:
         return None
